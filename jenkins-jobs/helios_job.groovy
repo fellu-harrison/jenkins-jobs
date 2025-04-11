@@ -13,13 +13,4 @@ pipelineJob('helios-build-deploy') {
             sandbox()
         }
     }
-
-    properties([
-        buildDiscarder(logRotator {
-            daysToKeep(-1)
-            numToKeep(20)
-            artifactDaysToKeep(-1)
-            artifactNumToKeep(20)
-        })
-    ])
 }
