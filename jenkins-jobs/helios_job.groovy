@@ -3,8 +3,6 @@ pipelineJob('helios-build-deploy') {
     displayName('Helios Build and Deploy')
     description('Pipeline to build and deploy Helios service across environments.')
 
-    concurrentBuild(false)
-
     parameters {
         stringParam('branch', '', 'Branch to test and deploy to dev, i.e EE-1111')
     }
