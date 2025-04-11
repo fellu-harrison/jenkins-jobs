@@ -14,12 +14,12 @@ pipelineJob('helios-build-deploy') {
         }
     }
 
-    properties {
-        buildDiscarder {
-            logRotator {
-                numToKeep(20)
-                artifactNumToKeep(20)
-            }
-        }
-    }
+    properties([
+        buildDiscarder(logRotator {
+            daysToKeep(-1)
+            numToKeep(20)
+            artifactDaysToKeep(-1)
+            artifactNumToKeep(20)
+        })
+    ])
 }
