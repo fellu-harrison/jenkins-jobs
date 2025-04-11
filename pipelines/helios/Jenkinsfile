@@ -1,1 +1,297 @@
+pipeline{
+    agent {
+    kubernetes {
+        inheritFrom 'built-in'
+        yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: aws
+    image: amazon/aws-cli
+    command: 
+      - cat
+    tty: true
+  - name: docker
+    dnsConfig:
+      options:
+      - name: single-request
+    image: docker:latest
+    readinessProbe:
+      exec: { command: ["docker", "ps"] }
+      initialDelaySeconds: 1
+      periodSeconds: 3
+    resources: { requests: { memory: 1Gi, cpu: 150m }, limits: { memory: 6Gi, cpu: 3 } }
+    securityContext: { privileged: true }
+    volumeMounts:
+    - { name: docker-socket, mountPath: /var/run }
+    - { name: docker-data, mountPath: /var/lib/docker }
+  imagePullSecrets:
+  - name: artifactory
+  volumes:
+  - { name: docker-socket, emptyDir: {} }
+  - { name: docker-data, emptyDir: {} }
+'''
+   }}  
+    environment { 
+        chart_dir = "assets/helm"
+        chart_name = "helios"
+        serviceName = "helios"
+        registry_nonprod = "374878012267.dkr.ecr.us-west-2.amazonaws.com"
+        registry_prod = "372500853281.dkr.ecr.us-west-2.amazonaws.com"
+        tfver = "1.9.0"
+        GIT_CREDENTIALS = credentials('my-mwt-ee-jenkins-nonprod-ssh')
+    }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20', artifactNumToKeepStr: '20'))
+    }
+    parameters {
+        string(name: 'branch', defaultValue: '', description: 'branch to test and deploy to dev, i.e EE-1111')
+    }
+    stages{
+        stage('checkout-scm'){
+            steps{
+                container('docker') {
+                    checkout([$class: 'GitSCM', branches: [[name: "${env.branch}"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'SubmoduleOption', disableSubmodules: false, parentCredentials: true, recursiveSubmodules: true, reference: '', trackingSubmodules: true]], submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: 'my-mwt-ee-jenkins-nonprod-ssh', url: "git@github.com:TheWeatherCompany/mwt-ee-${serviceName}.git"]]])
+                }
+                container('aws') {
+                    checkout([$class: 'GitSCM', branches: [[name: '*/feature/dev-virginia-eks']],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'mwt-ee-infra-live']], submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: 'my-mwt-ee-jenkins-nonprod-ssh', url: 'git@github.com:TheWeatherCompany/mwt-ee-infra-live.git']]])
+                } // end container
+            } // end steps
+        } // end stage 'checkout-scm'
+        stage("Build and Push Docker Image"){
+            steps{
+                container('docker') {
+                    script {
+                        sh """
+                        apk add git jq
+                        """
+                        GIT_COMMIT = sh(script: "git config --global --add safe.directory '*' && git rev-parse --short HEAD", returnStdout: true).trim()
+                        tag = sh(script: "echo \$(cat package.json | jq -r .version)\$(git config --global --add safe.directory '*' && git --no-pager log -n1  --pretty='format:%cd' --date=format:'%m%d%H%M' ${GIT_COMMIT})", returnStdout: true).trim()
+                        env.VERSION = "${tag}"
+                        buildName "${env.VERSION}"
+                    }
+                }
+                container('aws') {
+                    withAWS(credentials: "engage-eks-platform-dev-prod", region: "us-west-2") {
+                        sh """
+                        export TOKEN=`aws codeartifact get-authorization-token --domain engage --domain-owner 372500853281 --query authorizationToken --output text`
+                        sed -i.bak "s#authToken.*#authToken=\$TOKEN#" ./.npmrc
+                        """
+                    } // withAWS
+                } // container
+                container('docker') { 
+                    script{
+                        docker.withRegistry("https://${registry_nonprod}","ecr:us-west-2:engage-eks-platform-dev") {
+                            DOCKER_IMAGE = docker.build("${registry_nonprod}/${serviceName}:${env.VERSION}", "--network=host -f Dockerfile .")
+                            DOCKER_IMAGE.push()
+                        } // dockerwithRegistry
+                    } // script
+                } // container             
+            }// steps
+            // post {    
+            //     failure {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FF0000', message: "FAILED:  Build image '${serviceName}': Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            // }
+        } // END "build docker image" STAGE
 
+        stage("Install Helm and Terraform"){
+            steps{
+                container('aws') {
+                    sh '''
+                    cd /tmp
+                    yum update -y
+                    yum upgrade -y
+                    yum install bash curl git wget tar unzip jq -y
+                    wget https://get.helm.sh/helm-v3.9.4-linux-amd64.tar.gz
+                    tar -zxvf helm-v3.9.4-linux-amd64.tar.gz
+                    mv linux-amd64/helm /usr/local/bin/helm
+                    wget https://releases.hashicorp.com/terraform/${tfver}/terraform_${tfver}_linux_amd64.zip
+                    unzip terraform_${tfver}_linux_amd64.zip
+                    mv terraform /usr/bin/terraform
+                    wget https://github.com/gruntwork-io/terragrunt/releases/download/v0.40.2/terragrunt_linux_amd64
+                    mv terragrunt_linux_amd64 /usr/bin/terragrunt
+                    chmod u+x /usr/bin/terragrunt
+                    '''
+                }
+            }
+            // post {            
+            //     failure {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FF0000', message: "FAILED:  Build '${serviceName}' helm chart: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            // }
+        } // END "Install Helm and Terraform" STAGE
+
+        stage("Build and Push Helm Package to ECR"){
+            steps{
+                container('aws') {
+                    withAWS(credentials: "engage-eks-platform-dev", region: "us-west-2") {
+                        sh """
+                        aws ecr get-login-password --region us-west-2 | helm registry login --username AWS --password-stdin ${registry_nonprod}
+                        helm package ${chart_dir} --app-version ${env.VERSION} --version ${env.VERSION}
+                        helm push helm-chart-${chart_name}-${env.VERSION}.tgz oci://${registry_nonprod}/
+                        """
+                    } // end withAWS
+                } // end container
+            } // end steps
+            // post {            
+            //     failure {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FF0000', message: "FAILED:  Build helm ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            // }
+        } // END  "Build and Push Helm Package to ECR" STAGE
+
+        stage('Deploy DEV') {
+            options {
+                lock('wait_dev_deploy')
+            }
+            steps {
+                container('aws') {
+                    withAWS(credentials: 'engage-eks-platform-dev', region: "us-west-2") {
+                        withAWS(credentials: 'engage-eks-platform-dev', region: "us-west-2") {
+                            sshagent (credentials: ['my-mwt-ee-jenkins-nonprod-ssh']) {
+                                sh """
+                                mkdir -p ~/.ssh
+                                ssh-keyscan -t rsa github.com >> ~/.ssh/known_hosts
+                                aws eks list-clusters
+                                aws eks --region us-east-1 update-kubeconfig --name eis-dev-blue
+                                cd ./mwt-ee-infra-live/nonprod-east/eis-dev/blue/${serviceName}
+                                terragrunt apply -var=imageTag=${env.VERSION} -var=registry=${registry_nonprod} -auto-approve
+                                """
+                            } // end sshagent
+                        } // end withAWS us-east-1
+                    } // end withAWS us-west-2
+                } // end container
+            } // end steps
+            
+            // post {
+            //     success {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#00FF00', message: "SUCCESSFUL DEPLOY ON DEV ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            
+            //     failure {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FF0000', message: "FAILED:  DEPLOY ON DEV ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            // } 
+                
+        } // End stage 'Deploy DEV'
+
+        stage("Approve deploy to STG") {
+            agent none
+            steps {
+                milestone 1
+                input message: 'Deploy to STG?', ok: "yes", submitter: "Dev"
+            }
+        } // End state 'Approve deploy tp STG'
+        
+         stage('Push version to Prod ECR') {
+            steps {
+                container('aws') {
+                    withAWS(credentials: 'engage-eks-platform-dev', region: "us-west-2") {
+                      script {
+                        buildName "${env.VERSION}"
+                        sh """
+                        aws ecr get-login-password --region us-west-2 | helm registry login --username AWS --password-stdin ${registry_nonprod}
+                        helm pull oci://${registry_nonprod}/helm-chart-${serviceName} --version ${env.VERSION}
+                        """
+                      }
+                    } // end withAWS
+                    withAWS(credentials: 'engage-eks-platform-stg', region: "us-west-2") {
+                      script {
+                          sh """
+                          aws ecr get-login-password --region us-west-2 | helm registry login --username AWS --password-stdin ${registry_prod}
+                          helm push helm-chart-${serviceName}-${env.VERSION}.tgz oci://${registry_prod}/
+                          """
+                      } // end script
+                    } // end withAWS
+
+                    // withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+                    //     slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FFFF00', message: "STARTED PUSH TO STG ${serviceName}: Job: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+                    // }
+                } // end container
+                container('docker') {
+                  script {
+                    docker.withRegistry("https://${registry_nonprod}","ecr:us-west-2:engage-eks-platform-dev") {
+                      buildName "${env.VERSION}"
+                      DOCKER_IMAGE_DEV = docker.image("${registry_nonprod}/${serviceName}:${env.VERSION}")
+                      DOCKER_IMAGE_DEV.pull()
+                      sh("docker tag ${registry_nonprod}/${serviceName}:${env.VERSION} ${registry_prod}/${serviceName}:${env.VERSION}")
+                      DOCKER_IMAGE_PROD = docker.image("${registry_prod}/${serviceName}:${env.VERSION}")
+
+                    } // end withRegistry
+                    docker.withRegistry("https://${registry_prod}","ecr:us-west-2:engage-eks-platform-stg") {
+                      DOCKER_IMAGE_PROD.push() // Push with 'version' tag
+                      DOCKER_IMAGE_PROD.tag(["latest"]) // Re-Tag for AWS Inspector Filtering on "latest"
+                      DOCKER_IMAGE_PROD.push() // Push with 'latest' tag
+                    } // end withRegistry
+                  } // end script
+                } // end container
+            } // end steps
+            // post {
+            //     success {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#00FF00', message: "SUCCESSFUL PUSH VERSION ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+
+            //     failure {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FF0000', message: "FAILED:  PUSH VERSION ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            // }
+
+        } // End stage 'Push version to Prod ECR'
+
+        stage('Deploy STG') {
+            options {
+                lock('wait_stg_deploy')
+            }
+            steps {
+                container('aws') {
+                    withAWS(credentials: 'engage-eks-platform-dev', region: "us-west-2") {
+                        sshagent (credentials: ['my-mwt-ee-jenkins-nonprod-ssh']) {    
+                            sh """
+                            cd ./mwt-ee-infra-live/nonprod-west/eis-stg/green/${serviceName}
+                            terragrunt plan -var="imageTag=${env.VERSION}" -var="registry=${registry_nonprod}"
+                            """
+                        } // end sshagent   
+                   } // end withAWS
+                } // end container
+            }
+            // post {
+            //     success {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#00FF00', message: "SUCCESSFUL DEPLOY ON STG ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            
+            //     failure {
+            //         withCredentials([string(credentialsId: 'eis-engage-builds-slack', variable: 'eis-engage-builds-token')]) {
+            //             slackSend (channel: "#eis-jenkins", tokenCredentialId: "eis-engage-builds-slack", color: '#FF0000', message: "FAILED: DEPLOY ON STG ${serviceName}: Job '${env.JOB_NAME} [${env.BUILD_NUMBER}]' (${env.BUILD_URL})")
+            //         }
+            //     }
+            // }
+                
+        } // End stage 'Deploy STG'
+
+    }
+}
